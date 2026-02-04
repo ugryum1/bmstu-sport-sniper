@@ -6,6 +6,7 @@ import pickle
 import hashlib
 import logging
 import requests
+import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -16,6 +17,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+
+
+LAST_UPDATE_ID = 0
+LAST_SLOTS_CHECK = 0
+SLOTS_CHECK_INTERVAL = 180
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +51,7 @@ COOKIE_FILE = os.path.join(COOKIE_DIR, "bmstu_cookies.pkl")
 
 KNOWN_SLOTS = set()
 
+
 def send_telegram(text, parse_mode=None):
     try:
         data = {"chat_id": CHAT_ID, "text": text}
@@ -59,6 +66,7 @@ def send_telegram(text, parse_mode=None):
         response.raise_for_status()
     except Exception as e:
         logger.error(f"Failed to send Telegram message: {e}")
+
 
 def update_cookies_via_selenium():
     """Выполняет авторизацию через Selenium headless-браузер для обновления сессии."""
@@ -105,6 +113,7 @@ def update_cookies_via_selenium():
         if driver:
             driver.quit()
 
+
 def get_session():
     session = requests.Session()
     session.headers.update({
@@ -119,6 +128,7 @@ def get_session():
             logger.warning(f"Could not load cookies: {e}")
     return session
 
+
 def generate_slot_id(item):
     """Генерирует уникальный ID слота на основе ID API или хеша параметров."""
     if item.get('id'):
@@ -132,9 +142,10 @@ def generate_slot_id(item):
     ]
     return hashlib.md5("_".join(parts).encode()).hexdigest()
 
+
 def format_message(new_items):
     """Формирует читаемое сообщение для Telegram."""
-    msg_lines = ["<b>🔥 НАЙДЕНЫ НОВЫЕ СЛОТЫ!</b>\n"]
+    msg_lines = ["<b>🔥 ДОСТУПНЫ НОВЫЕ СЛОТЫ!</b>\n"]
 
     for item in new_items:
         name = item.get('section') or "Тренировка"
@@ -154,6 +165,7 @@ def format_message(new_items):
         msg_lines.append(card)
 
     return "\n\n".join(msg_lines)
+
 
 def check_slots():
     global KNOWN_SLOTS
@@ -207,16 +219,120 @@ def check_slots():
     except Exception as e:
         logger.error(f"Unexpected error during check: {e}")
 
+
+def get_all_available_slots():
+    """Возвращает список всех доступных для записи слотов (vacancy > 0)."""
+    session = get_session()
+    slots = []
+
+    try:
+        response = session.get(API_URL, timeout=15)
+
+        if response.status_code in [401, 403]:
+            logger.warning("Access denied while fetching slots for /start.")
+            update_cookies_via_selenium()
+            return []
+
+        if response.status_code != 200:
+            logger.error(f"API Error while fetching slots: {response.status_code}")
+            return []
+
+        days_list = response.json() or []
+
+        for day_data in days_list:
+            for group in day_data.get('groups', []):
+                if int(group.get('vacancy', 0)) > 0:
+                    slots.append(group)
+
+    except Exception as e:
+        logger.error(f"Error fetching slots for /start: {e}")
+
+    return slots
+
+
+def handle_start_command():
+    """Обрабатывает команду /start (мгновенный ответ)."""
+    logger.info("Processing /start command")
+    send_telegram(
+        "Привет! Я слежу за свободными местами на физкультуру.\n\n"
+        "Чтобы посмотреть список доступных записей прямо сейчас, нажмите /check"
+    )
+
+
+def handle_check_command():
+    """Обрабатывает команду /check (запрос актуальных данных)."""
+    logger.info("Processing /check command")
+
+    # Можно отправить промежуточное сообщение, чтобы пользователь видел - процесс идет
+    # send_telegram("🔍 Проверяю актуальные слоты, подождите...")
+
+    slots = get_all_available_slots()
+
+    if not slots:
+        send_telegram("❌ На данный момент доступных записей нет.")
+        return
+
+    text = format_message(slots)
+    link = "https://lks.bmstu.ru/fv/new-record"
+    full_text = f"{text}\n\n<a href='{link}'><b>ПЕРЕЙТИ К ЗАПИСИ</b></a>"
+    send_telegram(full_text, parse_mode="HTML")
+
+
+def check_telegram_commands():
+    global LAST_UPDATE_ID
+    try:
+        response = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"offset": LAST_UPDATE_ID + 1, "timeout": 1},
+            timeout=5
+        )
+        if response.status_code == 200:
+            updates = response.json().get("result", [])
+            for update in updates:
+                LAST_UPDATE_ID = update["update_id"]
+                if "message" in update and "text" in update["message"]:
+                    cmd = update["message"]["text"].strip().lower()
+
+                    if cmd == "/start":
+                        handle_start_command()
+                    elif cmd == "/check":
+                        handle_check_command()
+
+    except Exception as e:
+        logger.error(f"Error in commands thread: {e}")
+
+
+def telegram_loop():
+    """Бесконечный цикл для мгновенной обработки команд"""
+    logger.info("Telegram command listener started.")
+    while True:
+        check_telegram_commands()
+        time.sleep(0.5) # Минимальная пауза, чтобы не спамить CPU
+
+
 def main():
     logger.info("Service started. Monitoring BMSTU slots.")
 
-    # Первичная проверка наличия кук
+    # 1. Первичная авторизация
     if not os.path.exists(COOKIE_FILE):
         update_cookies_via_selenium()
 
+    # 2. Запускаем обработку команд в ОТДЕЛЬНОМ потоке
+    # Это позволит боту отвечать на /start мгновенно,
+    # даже если основная программа занята проверкой слотов
+    cmd_thread = threading.Thread(target=telegram_loop, daemon=True)
+    cmd_thread.start()
+
+    # 3. Основной цикл (только мониторинг слотов)
     while True:
-        check_slots()
-        time.sleep(180)
+        try:
+            check_slots()
+        except Exception as e:
+            logger.error(f"Main loop error: {e}")
+
+        # Ждем 3 минуты до следующей проверки
+        time.sleep(SLOTS_CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
