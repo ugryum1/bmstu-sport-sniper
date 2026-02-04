@@ -10,5 +10,6 @@ services:
       - ./cookies:/app/cookies
     environment:
       # Явно указываем путь к хрому и драйверу (для надежности)
+      - TZ=Europe/Moscow
       - CHROME_BIN=/usr/bin/chromium
       - CHROMEDRIVER_PATH=/usr/bin/chromedriver

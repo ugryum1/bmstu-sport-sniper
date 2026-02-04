@@ -54,19 +54,29 @@ def update_cookies_via_selenium():
     options.add_argument("--window-size=1920,1080")
     # ----------------------------
 
-    # Пытаемся установить драйвер. В Dockerfile мы ставим chromium-driver,
-    # поэтому webdriver_manager может не понадобиться, но оставим для универсальности.
-    try:
+    # --- ИСПРАВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ ДРАЙВЕРА ---
+
+    # 1. Проверяем, задан ли путь к хрому вручную (через Docker env)
+    chrome_bin = os.environ.get("CHROME_BIN")
+    if chrome_bin:
+        options.binary_location = chrome_bin
+
+    # 2. Выбираем драйвер: либо системный (Docker), либо скачиваем (Локально)
+    system_driver = os.environ.get("CHROMEDRIVER_PATH")
+
+    if system_driver and os.path.exists(system_driver):
+        print(f"🔧 Использую системный драйвер: {system_driver}")
+        service = Service(system_driver)
+    else:
+        print("🔧 Скачиваю драйвер через Manager (Локальный режим)...")
         service = Service(ChromeDriverManager().install())
+
+    # 3. Запускаем
+    try:
         driver = webdriver.Chrome(service=service, options=options)
     except Exception as e:
-        print(f"Ошибка инициализации драйвера (возможно, нужны пути для Docker): {e}")
-        # Фолбек для жестко заданных путей в Docker (если переменные среды заданы в compose)
-        if os.environ.get("CHROMEDRIVER_PATH"):
-             service = Service(os.environ.get("CHROMEDRIVER_PATH"))
-             driver = webdriver.Chrome(service=service, options=options)
-        else:
-             raise e
+        print(f"❌ Критическая ошибка запуска Chrome: {e}")
+        raise e
 
     try:
         # 1. Идем на защищенную страницу -> нас редиректит на SSO
